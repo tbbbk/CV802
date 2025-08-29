@@ -1,7 +1,9 @@
+import os
 import numpy as np
 import open3d as o3d
 import os.path as osp
 import glob
+import pycolmap
 
 from utils.thread_utils import run_on_thread
 
@@ -144,10 +146,58 @@ class ColmapAPI:
         # You can load the cached data here before adding points and cameras
 
         # Add points
-        pcd = o3d.geometry.PointCloud()
+            
+        def colmap_points_to_open3d(points3D):
+            xyz = []
+            rgb = []
 
-        # Add cameras
-        colmap_cameras = {}
+            for p3d in points3D.values():
+                xyz.append(p3d.xyz)
+                rgb.append(p3d.color / 255.0)
+
+            xyz = np.array(xyz)
+            rgb = np.array(rgb)
+
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(xyz)
+            pcd.colors = o3d.utility.Vector3dVector(rgb)
+
+            return pcd
+        
+        os.makedirs(self.data_path + "/colmap", exist_ok=True)
+        pycolmap.extract_features(self.database_path, self.image_dir)
+        pycolmap.match_exhaustive(self.database_path)
+        maps = pycolmap.incremental_mapping(self.database_path, self.image_dir, self.sparse_dir)
+
+        pcd = colmap_points_to_open3d(maps[0].points3D)
+
+        def colmap_cameras_to_dict(reconstruction):
+            cameras_dict = {}
+
+            for _, image in reconstruction.images.items():
+                cam = reconstruction.cameras[image.camera_id]
+
+                transform = image.cam_from_world()
+                R = transform.rotation.matrix()
+                t = transform.translation
+                
+                intrinsics = {
+                    "width": cam.width,
+                    "height": cam.height,
+                    "fx": cam.focal_length_x,
+                    "fy": cam.focal_length_y,
+                    "cx": cam.params[1],
+                    "cy": cam.params[2],
+                }
+
+                cameras_dict[image.name] = {
+                    "extrinsic": [R, t],
+                    "intrinsic": intrinsics
+                }
+
+            return cameras_dict
+        
+        colmap_cameras = colmap_cameras_to_dict(maps[0])
 
         ####### End of your code #####################
 
