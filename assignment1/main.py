@@ -12,6 +12,7 @@ def main():
 
     w = AppWindow(1024, 768)
 
+    # they dont even implement this file loading...
     if len(sys.argv) > 1:
         path = sys.argv[1]
         if os.path.exists(path):
