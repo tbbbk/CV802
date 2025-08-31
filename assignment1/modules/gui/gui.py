@@ -551,3 +551,78 @@ class AppWindow:
             o3d.io.write_image(path, img, quality)
 
         self._scene.scene.scene.render_to_image(on_image)
+
+    def load(self, path):
+        """Load a dataset or an existing COLMAP result from `path`.
+
+    - If `path` contains an `images/` subfolder:
+        * If `colmap/` with database + sparse exists, load existing result.
+        * Else, just set data_path and enable the "Run COLMAP" button.
+    - If `path` itself is an `images/` folder, use its parent as data_path.
+    Otherwise, show an error dialog.
+    """
+        import os
+        data_path = path
+
+        # If user passed the images folder directly, step up one level
+        if os.path.isdir(path) and os.path.basename(path).lower() == "images":
+            data_path = os.path.dirname(path)
+
+        images_dir = os.path.join(data_path, "images")
+        if not os.path.isdir(images_dir):
+            em = self.window.theme.font_size
+            dlg = gui.Dialog("Error")
+            dlg_layout = gui.Vert(em / 2, gui.Margins(em, em, em, em))
+            dlg_layout.add_child(gui.Label("This folder does not contain an 'images/' subfolder."))
+            ok = gui.Button("OK"); ok.set_on_clicked(self._on_error_ok)
+            h = gui.Horiz(); h.add_stretch(); h.add_child(ok); h.add_stretch()
+            dlg_layout.add_child(h)
+            dlg.add_child(dlg_layout)
+            self.window.show_dialog(dlg)
+            return
+
+        # Set data path
+        self.colmap_api.data_path = data_path
+
+        # If existing COLMAP outputs are present, load them immediately
+        if self.colmap_api.check_colmap_folder_valid():
+            self._scene.scene.clear_geometry()
+            self.colmap_api.estimate_cameras(recompute=False)
+            self._add_geometries_from_colmap()
+            # Populate camera dropdown if present
+            if hasattr(self, "_camera_list"):
+                self._camera_list.clear_items()
+                for name in self.colmap_api.camera_names:
+                    self._camera_list.add_item(name)
+                if self.colmap_api.camera_names:
+                    self._camera_list.selected_text = self.colmap_api.camera_names[0]
+            return
+
+        # Otherwise, verify there are images and enable the run button
+        if len(self.colmap_api._list_images_in_folder(images_dir)) == 0:
+            self.colmap_api.data_path = None
+            em = self.window.theme.font_size
+            dlg = gui.Dialog("Error")
+            dlg_layout = gui.Vert(em / 2, gui.Margins(em, em, em, em))
+            dlg_layout.add_child(gui.Label("There are no images in this folder."))
+            ok = gui.Button("OK"); ok.set_on_clicked(self._on_error_ok)
+            h = gui.Horiz(); h.add_stretch(); h.add_child(ok); h.add_stretch()
+            dlg_layout.add_child(h)
+            dlg.add_child(dlg_layout)
+            self.window.show_dialog(dlg)
+            return
+
+        # We have images but no COLMAP results yet → enable the "Run COLMAP" button.
+        if hasattr(self, "_fit_colmap_button"):
+            self._fit_colmap_button.enabled = True
+
+        # Informative dialog
+        em = self.window.theme.font_size
+        dlg = gui.Dialog("Info")
+        dlg_layout = gui.Vert(em / 2, gui.Margins(em, em, em, em))
+        dlg_layout.add_child(gui.Label("Image folder loaded. Use the COLMAP button to run reconstruction."))
+        ok = gui.Button("OK"); ok.set_on_clicked(self._on_info_ok)
+        h = gui.Horiz(); h.add_stretch(); h.add_child(ok); h.add_stretch()
+        dlg_layout.add_child(h)
+        dlg.add_child(dlg_layout)
+        self.window.show_dialog(dlg)
