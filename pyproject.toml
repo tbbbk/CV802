@@ -7,5 +7,6 @@ requires-python = "==3.10.*"
 dependencies = [
     "open3d==0.18.0",
     "numpy==1.26.1",
+    "pycolmap"
 ]
 

@@ -1,7 +1,9 @@
+import os
 import numpy as np
 import open3d as o3d
 import os.path as osp
 import glob
+import pycolmap
 
 from utils.thread_utils import run_on_thread
 
@@ -135,19 +137,154 @@ class ColmapAPI:
         '''
 
         ## Insert your code below
+        def _ensure_dirs():
+            os.makedirs(osp.join(self.data_path, "colmap"), exist_ok=True)
+            os.makedirs(self.sparse_dir, exist_ok=True)
+
+        def _list_model_subdirs(base):
+            if not osp.isdir(base):
+                return []
+            subs = []
+            for d in os.listdir(base):
+                full = osp.join(base, d)
+                if osp.isdir(full) and d.isdigit():
+                    subs.append((int(d), full))
+            subs.sort(key=lambda x: x[0])
+            return subs
+
+        def _load_cached_reconstructions():
+            maps = {}
+            for mid, mdir in _list_model_subdirs(self.sparse_dir):
+                try:
+                    # pycolmap.Reconstruction can be constructed from a model directory
+                    maps[mid] = pycolmap.Reconstruction(mdir)
+                except Exception as e:
+                    print(f"Warning: failed to load reconstruction {mdir}: {e}")
+            return maps
+
+        def _run_matching(db_path):
+            # Choose matching strategy
+            if self._matcher == 'exhaustive_matcher':
+                pycolmap.match_exhaustive(db_path, sift_options=sift_opts)
+            elif self._matcher == 'vocab_tree_matcher':
+                if not osp.isfile(VOCAB_PATH):
+                    raise FileNotFoundError(
+                        f"Vocabulary tree not found at {VOCAB_PATH}. "
+                        f"Either place the file there or change VOCAB_PATH."
+                    )
+                pycolmap.match_vocabulary_tree(db_path, VOCAB_PATH, sift_options=sift_opts)
+            elif self._matcher == 'sequential_matcher':
+                # Uses temporal proximity (good for videos)
+                pycolmap.match_sequential(db_path, sift_options=sift_opts)
+            else:
+                raise ValueError(f"Unknown matcher: {self._matcher}")
+
+        def _run_pipeline():
+            # Extract SIFT, match per chosen matcher, run mapper; write models under sparse_dir
+            # (Re)create DB if recomputing
+            if osp.isfile(self.database_path):
+                os.remove(self.database_path)
+
+            # Extract features
+            pycolmap.extract_features(
+                self.database_path,
+                self.image_dir,
+                camera_model=self.camera_model,   # e.g., 'SIMPLE_RADIAL', 'PINHOLE', etc.
+                sift_options=sift_opts
+            )
+            # Match features
+            _run_matching(self.database_path)
+            # Mapping (incremental)
+            maps_local = pycolmap.incremental_mapping(
+                self.database_path,
+                self.image_dir,
+                self.sparse_dir
+            )
+            return maps_local
+        if not osp.isdir(self.image_dir):
+            raise FileNotFoundError(f"Image folder not found: {self.image_dir}")
+
+        image_files = self._list_images_in_folder(self.image_dir)
+        if len(image_files) == 0:
+            raise RuntimeError(f"No images found under {self.image_dir}")
+        
+        sift_opts = {
+            "use_gpu": False,
+            "gpu_index": self._gpu_index
+        }
+
+        _ensure_dirs()
+
         if recompute:
             # Compute the result once and cache it in self.data_path. This will save a lot of time on the next run
             # If you use COLMAP, save the database and bundle adjustment data in self.database_dir and
             # self.sparse_dir, respectively.
-            pass
+            maps = _run_pipeline()
+        else: 
+            maps = _load_cached_reconstructions()
+            if not maps:
+                maps = _run_pipeline()
 
         # You can load the cached data here before adding points and cameras
 
         # Add points
-        pcd = o3d.geometry.PointCloud()
+            
+        def colmap_points_to_open3d(points3D):
+            xyz = []
+            rgb = []
 
-        # Add cameras
-        colmap_cameras = {}
+            for p3d in points3D.values():
+                xyz.append(p3d.xyz)
+                rgb.append(p3d.color / 255.0)
+
+            xyz = np.array(xyz)
+            rgb = np.array(rgb)
+
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(xyz)
+            pcd.colors = o3d.utility.Vector3dVector(rgb)
+
+            return pcd
+        
+        chosen_id = sorted(maps.keys())[0]
+        reconstruction = maps[chosen_id]
+
+        pcd = colmap_points_to_open3d(reconstruction.points3D)
+
+        os.makedirs(self.data_path + "/colmap", exist_ok=True)
+        pycolmap.extract_features(self.database_path, self.image_dir)
+        pycolmap.match_exhaustive(self.database_path)
+        maps = pycolmap.incremental_mapping(self.database_path, self.image_dir, self.sparse_dir)
+
+        pcd = colmap_points_to_open3d(maps[0].points3D)
+
+        def colmap_cameras_to_dict(reconstruction):
+            cameras_dict = {}
+
+            for _, image in reconstruction.images.items():
+                cam = reconstruction.cameras[image.camera_id]
+
+                transform = image.cam_from_world()
+                R = transform.rotation.matrix()
+                t = transform.translation
+                
+                intrinsics = {
+                    "width": cam.width,
+                    "height": cam.height,
+                    "fx": cam.focal_length_x,
+                    "fy": cam.focal_length_y,
+                    "cx": cam.params[1],
+                    "cy": cam.params[2],
+                }
+
+                cameras_dict[image.name] = {
+                    "extrinsic": [R, t],
+                    "intrinsic": intrinsics
+                }
+
+            return cameras_dict
+        
+        colmap_cameras = colmap_cameras_to_dict(maps[0])
 
         ####### End of your code #####################
 

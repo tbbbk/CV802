@@ -119,12 +119,14 @@ source = { virtual = "." }
 dependencies = [
     { name = "numpy" },
     { name = "open3d" },
+    { name = "pycolmap" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = "==1.26.1" },
     { name = "open3d", specifier = "==0.18.0" },
+    { name = "pycolmap" },
 ]
 
 [[package]]
@@ -514,6 +516,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a0/64/850de5076f4436410e1ce4f6a69f4313ef6215dfea155f3f6559335cad29/plotly-6.3.0.tar.gz", hash = "sha256:8840a184d18ccae0f9189c2b9a2943923fd5cae7717b723f36eef78f444e5a73", size = 6923926, upload-time = "2025-08-12T20:22:14.127Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/95/a9/12e2dc726ba1ba775a2c6922d5d5b4488ad60bdab0888c337c194c8e6de8/plotly-6.3.0-py3-none-any.whl", hash = "sha256:7ad806edce9d3cdd882eaebaf97c0c9e252043ed1ed3d382c3e3520ec07806d4", size = 9791257, upload-time = "2025-08-12T20:22:09.205Z" },
+]
+
+[[package]]
+name = "pycolmap"
+version = "3.12.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2a/1a/6be18145dfbaf7eef211cc4b98e1b9d8e18a9f61face3025e1ece81bf1d2/pycolmap-3.12.5-cp310-cp310-macosx_13_0_x86_64.whl", hash = "sha256:467136fe52962f802566a11abf26d4460f2264c9d5769e2e13191b5e6aa2335c", size = 16091014, upload-time = "2025-08-22T11:55:45.865Z" },
+    { url = "https://files.pythonhosted.org/packages/21/e1/6421b5fb12c95b0d32f3e4121ef430bedce76d9902aa2c0f3dcf9441e47f/pycolmap-3.12.5-cp310-cp310-macosx_14_0_arm64.whl", hash = "sha256:e2b109dd9873789bf96828328e53c49501dbb74278d41ddf9b1bff3ca8547ea3", size = 14153486, upload-time = "2025-08-22T11:55:48.631Z" },
+    { url = "https://files.pythonhosted.org/packages/21/79/0fe94f81013fb6deeaba0737f8c8655f29e5961159dad175defc65197bd6/pycolmap-3.12.5-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:4bc98f31e1de5edb82b4f31173717fcab19c99edd56d93e4a69e6683457d4ac1", size = 19950443, upload-time = "2025-08-22T11:55:51.254Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/80/d9a5fd9bde5413323e2a6fbacddc3fa1211d1c98a9e75d8db7cd99a759b2/pycolmap-3.12.5-cp310-cp310-win_amd64.whl", hash = "sha256:d4c673bc3c62843e11a0ebff6906d6f06aba2045566b92f77d96bf35233dd77c", size = 18355257, upload-time = "2025-08-22T11:55:54.043Z" },
 ]
 
 [[package]]
