@@ -219,11 +219,22 @@ class ColmapAPI:
             # Compute the result once and cache it in self.data_path. This will save a lot of time on the next run
             # If you use COLMAP, save the database and bundle adjustment data in self.database_dir and
             # self.sparse_dir, respectively.
-            maps = _run_pipeline()
+            os.makedirs(self.data_path + "/colmap", exist_ok=True)
+            pycolmap.extract_features(self.database_path, self.image_dir)
+            pycolmap.match_exhaustive(self.database_path)
+            maps = pycolmap.incremental_mapping(self.database_path, self.image_dir, self.sparse_dir)
+            # maps = _run_pipeline()
         else: 
             maps = _load_cached_reconstructions()
             if not maps:
-                maps = _run_pipeline()
+                # maps = _run_pipeline()
+                print("No cached data found. Running COLMAP...")
+                os.makedirs(self.data_path + "/colmap", exist_ok=True)
+                pycolmap.extract_features(self.database_path, self.image_dir)
+                pycolmap.match_exhaustive(self.database_path)
+                maps = pycolmap.incremental_mapping(self.database_path, self.image_dir, self.sparse_dir)
+            else:
+                print("Cached data found. Loading...")
 
         # You can load the cached data here before adding points and cameras
 
@@ -246,15 +257,11 @@ class ColmapAPI:
 
             return pcd
         
-        chosen_id = sorted(maps.keys())[0]
-        reconstruction = maps[chosen_id]
+        # chosen_id = sorted(maps.keys())[0]
+        # reconstruction = maps[chosen_id]
 
-        pcd = colmap_points_to_open3d(reconstruction.points3D)
+        # pcd = colmap_points_to_open3d(reconstruction.points3D)
 
-        os.makedirs(self.data_path + "/colmap", exist_ok=True)
-        pycolmap.extract_features(self.database_path, self.image_dir)
-        pycolmap.match_exhaustive(self.database_path)
-        maps = pycolmap.incremental_mapping(self.database_path, self.image_dir, self.sparse_dir)
 
         pcd = colmap_points_to_open3d(maps[0].points3D)
 
