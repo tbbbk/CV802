@@ -142,3 +142,7 @@ cython_debug/
 
 
 *_101.md
+
+
+*.DS_Store
+*.db

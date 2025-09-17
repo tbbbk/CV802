@@ -212,7 +212,7 @@ class AppWindow:
         self._apply_settings()
 
     def _on_fit_colmap_button(self):
-        self.colmap_api.estimate_cameras()
+        self.colmap_api.estimate_cameras(recompute=True)
 
         em = self.window.theme.font_size
         dlg = gui.Dialog("Error")
