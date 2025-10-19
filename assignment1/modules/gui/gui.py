@@ -52,6 +52,12 @@ class AppWindow:
         self._scene = gui.SceneWidget()
         self._scene.scene = rendering.Open3DScene(w.renderer)
 
+        self._mesh_geometry = None
+        self._mesh_material = None
+        self._mesh_path = None
+        self._mesh_loaded = False
+        self._mesh_visible = False
+
         # Sizing
         em = w.theme.font_size
         separation_height = int(round(0.5 * em))
@@ -122,8 +128,14 @@ class AppWindow:
         self._fit_colmap_button.horizontal_padding_em = 0.2
         self._fit_colmap_button.enabled = False
         self._fit_colmap_button.set_on_clicked(self._on_fit_colmap_button)
+        self._show_mesh_button = gui.Button("Show Constructed Mesh")
+        self._show_mesh_button.horizontal_padding_em = 0.2
+        self._show_mesh_button.enabled = False
+        self._show_mesh_button.set_on_clicked(self._on_show_mesh_button)
         h.add_stretch()
         h.add_child(self._fit_colmap_button)
+        h.add_fixed(0.5 * em)
+        h.add_child(self._show_mesh_button)
         h.add_stretch()
         colmap_ctrls.add_child(h)
 
@@ -212,6 +224,7 @@ class AppWindow:
         self._apply_settings()
 
     def _on_fit_colmap_button(self):
+        self._reset_mesh_state()
         self.colmap_api.estimate_cameras(recompute=True)
 
         em = self.window.theme.font_size
@@ -303,6 +316,119 @@ class AppWindow:
     def _set_mouse_mode_model(self):
         self._scene.set_view_controls(gui.SceneWidget.Controls.ROTATE_MODEL)
 
+    def _reset_mesh_state(self, disable_button=True):
+        try:
+            self._scene.scene.remove_geometry("__mesh__")
+        except Exception:
+            pass
+        self._mesh_geometry = None
+        self._mesh_material = None
+        self._mesh_path = None
+        self._mesh_loaded = False
+        self._mesh_visible = False
+        if hasattr(self, "_show_mesh_button"):
+            self._show_mesh_button.text = "Show Constructed Mesh"
+            if disable_button:
+                self._show_mesh_button.enabled = False
+
+    def _remove_geometry(self, name):
+        try:
+            self._scene.scene.remove_geometry(name)
+        except Exception:
+            pass
+
+    def _locate_mesh_file(self):
+        if self._mesh_path and osp.isfile(self._mesh_path):
+            return self._mesh_path
+        data_path = getattr(self.colmap_api, "data_path", None)
+        if not data_path:
+            return None
+        candidates = []
+        search_roots = [data_path]
+        colmap_dir = getattr(self.colmap_api, "colmap_dir", None)
+        if colmap_dir and osp.isdir(colmap_dir):
+            search_roots.append(colmap_dir)
+        for root in search_roots:
+            candidates.extend(glob.glob(osp.join(root, "*.ply")))
+        if not candidates:
+            candidates = glob.glob(osp.join(data_path, "**", "*.ply"), recursive=True)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: (0 if "mesh" in osp.basename(p).lower() else 1, p))
+        self._mesh_path = candidates[0]
+        return self._mesh_path
+
+    def _show_message(self, title, message):
+        em = self.window.theme.font_size
+        dlg = gui.Dialog(title)
+        dlg_layout = gui.Vert(em / 2, gui.Margins(em, em, em, em))
+        dlg_layout.add_child(gui.Label(message))
+        ok = gui.Button("OK")
+        ok.set_on_clicked(self._on_error_ok)
+        h = gui.Horiz()
+        h.add_stretch()
+        h.add_child(ok)
+        h.add_stretch()
+        dlg_layout.add_child(h)
+        dlg.add_child(dlg_layout)
+        self.window.show_dialog(dlg)
+
+    def _load_mesh_geometry(self):
+        mesh_path = self._locate_mesh_file()
+        if not mesh_path:
+            if hasattr(self, "_show_mesh_button"):
+                self._show_mesh_button.enabled = False
+            self._show_message("Error", "No mesh (.ply) file found for this dataset.")
+            return False
+        if self._mesh_loaded and self._mesh_geometry is not None:
+            return True
+        mesh = o3d.io.read_triangle_mesh(mesh_path)
+        if mesh.is_empty():
+            self._show_message("Error", f"Mesh is empty: {osp.basename(mesh_path)}")
+            return False
+        if not mesh.has_vertex_normals():
+            mesh.compute_vertex_normals()
+        material = rendering.MaterialRecord()
+        material.shader = "defaultLit"
+        material.base_color = (1.0, 1.0, 1.0, 1.0)
+        self._mesh_geometry = mesh
+        self._mesh_material = material
+        self._mesh_loaded = True
+        return True
+
+    def _update_mesh_button_state(self):
+        has_mesh = self._locate_mesh_file() is not None
+        if hasattr(self, "_show_mesh_button"):
+            self._show_mesh_button.enabled = has_mesh
+            if not has_mesh:
+                self._show_mesh_button.text = "Show Constructed Mesh"
+
+    def _show_mesh(self):
+        self._remove_geometry("__mesh__")
+        self._remove_geometry("__model__")
+        self._scene.scene.add_geometry("__mesh__", self._mesh_geometry, self._mesh_material)
+        self._mesh_visible = True
+        if hasattr(self, "_show_mesh_button"):
+            self._show_mesh_button.text = "Show Point Cloud"
+        self.window.post_redraw()
+
+    def _show_point_cloud(self):
+        self._remove_geometry("__mesh__")
+        if self.colmap_api.pcd is not None:
+            self._remove_geometry("__model__")
+            self._scene.scene.add_geometry("__model__", self.colmap_api.pcd, self.settings.material)
+        self._mesh_visible = False
+        if hasattr(self, "_show_mesh_button"):
+            self._show_mesh_button.text = "Show Constructed Mesh"
+        self.window.post_redraw()
+
+    def _on_show_mesh_button(self):
+        if self._mesh_visible:
+            self._show_point_cloud()
+            return
+        if self._load_mesh_geometry():
+            self._show_mesh()
+
     def _on_bg_color(self, new_color):
         self.settings.bg_color = new_color
         self._apply_settings()
@@ -345,6 +471,7 @@ class AppWindow:
 
     def _on_load_image_folder_dialog_done(self, data_path):
         self.window.close_dialog()
+        self._reset_mesh_state()
 
         self.colmap_api.data_path = data_path
 
@@ -464,6 +591,7 @@ class AppWindow:
         self._update_camera()
 
     def load_existing_result(self, data_path):
+        self._reset_mesh_state()
         self._scene.scene.clear_geometry()
 
         self.colmap_api.data_path = data_path
@@ -494,6 +622,11 @@ class AppWindow:
     def _add_geometries_from_colmap(self):
         w = self.window
         if self.colmap_api.estimate_done():
+            self._remove_geometry("__mesh__")
+            self._mesh_visible = False
+            self._mesh_loaded = False
+            if hasattr(self, "_show_mesh_button"):
+                self._show_mesh_button.text = "Show Constructed Mesh"
             self._scene.scene.add_geometry("__model__", self.colmap_api.pcd, self.settings.material)
 
             # Update camera list in GUI
@@ -510,6 +643,7 @@ class AppWindow:
             self._visualize_cameras()
             self._update_camera()
 
+            self._update_mesh_button_state()
             w = self.window  # to make the code more concise
             w.set_needs_layout()
         else:
@@ -582,6 +716,7 @@ class AppWindow:
             return
 
         # Set data path
+        self._reset_mesh_state()
         self.colmap_api.data_path = data_path
 
         # If existing COLMAP outputs are present, load them immediately
