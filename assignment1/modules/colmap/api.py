@@ -1,3 +1,4 @@
+from math import perm
 import os
 import numpy as np
 import open3d as o3d
@@ -8,6 +9,13 @@ import copy  # ### NEW
 from typing import Optional, Tuple  # ### NEW
 
 from utils.thread_utils import run_on_thread
+import utils.colmap_read_model as read_model
+from utils.colmap2mvsnet_acm import processing_single_scene
+from PIL import Image
+# opencv
+import cv2 as cv
+import trimesh
+import glob
 
 
 VOCAB_PATH = 'modules/colmap/vocab_tree_flickr100K_words32K.bin'
@@ -201,6 +209,7 @@ class ColmapAPI:
             raise ValueError("clean_point_cloud: empty point cloud")
 
         p = copy.deepcopy(pcd)
+        indices = np.arange(len(p.points), dtype=np.int64)
 
         # 1) voxel downsample (makes later steps more stable)
         if voxel_size is not None and voxel_size > 0:
@@ -211,12 +220,14 @@ class ColmapAPI:
 
         # 2) Statistical outlier removal
         if sor_nb_neighbors is not None and sor_nb_neighbors > 0 and sor_std_ratio is not None:
-            p, _ = p.remove_statistical_outlier(nb_neighbors=int(sor_nb_neighbors), std_ratio=float(sor_std_ratio))
+            p, ind = p.remove_statistical_outlier(nb_neighbors=int(sor_nb_neighbors), std_ratio=float(sor_std_ratio))
+            indices = indices[np.asarray(ind, dtype=np.int64)]
 
         # 3) Radius outlier removal
         use_radius = radius if radius is not None else (3.0 * mean_nn if mean_nn > 0 else None)
         if use_radius is not None and min_points is not None and min_points > 0:
-            p, _ = p.remove_radius_outlier(nb_points=int(min_points), radius=float(use_radius))
+            p, ind = p.remove_radius_outlier(nb_points=int(min_points), radius=float(use_radius))
+            indices = indices[np.asarray(ind, dtype=np.int64)]
 
         # 4) Largest connected component (DBSCAN) to drop floating noise clusters
         if dbscan_keep_largest and len(p.points) > 0:
@@ -230,13 +241,16 @@ class ColmapAPI:
                         valid_labels, counts = np.unique(labels[mask], return_counts=True)
                         largest_label = valid_labels[np.argmax(counts)]
                         keep = (labels == largest_label)
-                        p = p.select_by_index(np.where(keep)[0])
+                        # p = p.select_by_index(np.where(keep)[0])
+                        idx_keep = np.where(keep)[0]
+                        p = p.select_by_index(idx_keep.tolist())
+                        indices = indices[idx_keep]
 
         # 5) Optional densify
         if densify_to is not None and densify_to > len(p.points):
             p = self.densify_point_cloud_via_poisson(p, target_points=int(densify_to))
 
-        return p
+        return p, np.asarray(indices, dtype=np.int64)
 
     # ### NEW
     def densify_point_cloud_via_poisson(
@@ -376,7 +390,7 @@ class ColmapAPI:
         mp = dict(self._default_mesh)
         if meshing_params: mp.update(meshing_params)
 
-        pcd_clean = self.clean_point_cloud(
+        pcd_clean, _ = self.clean_point_cloud(
             pcd_raw,
             voxel_size=cp['voxel_size'],
             sor_nb_neighbors=cp['sor_nb_neighbors'],
@@ -533,10 +547,17 @@ class ColmapAPI:
         def colmap_points_to_open3d(points3D):
             xyz = []
             rgb = []
+            point_ids = []
+            image_ids = []
 
-            for p3d in points3D.values():
+            for pid in sorted(points3D.keys()):
+                p3d = points3D[pid]
+                point_ids.append(pid)
                 xyz.append(p3d.xyz)
                 rgb.append(p3d.color / 255.0)
+                elems = getattr(p3d.track, "elements", p3d.track)
+                ids = [int(e.image_id) for e in elems]
+                image_ids.append([int(i) for i in ids])
 
             xyz = np.array(xyz)
             rgb = np.array(rgb)
@@ -546,7 +567,7 @@ class ColmapAPI:
             if rgb.shape[0] == xyz.shape[0]:
                 pcd.colors = o3d.utility.Vector3dVector(rgb)
 
-            return pcd
+            return pcd, np.asarray(point_ids, dtype=np.int64), image_ids
 
         def colmap_cameras_to_dict(reconstruction):
             cameras_dict = {}
@@ -580,10 +601,10 @@ class ColmapAPI:
         chosen_id = sorted(maps.keys())[0]
         reconstruction = maps[chosen_id]
 
-        pcd_raw = colmap_points_to_open3d(reconstruction.points3D)
+        pcd_raw, point_ids, point_image_ids = colmap_points_to_open3d(reconstruction.points3D)
 
         # ### NEW: run cleaning on the sparse point cloud (toggle/adjust params via self._default_cleaning)
-        pcd_clean = self.clean_point_cloud(
+        pcd_clean, keep_indices = self.clean_point_cloud(
             pcd_raw,
             voxel_size=self._default_cleaning['voxel_size'],
             sor_nb_neighbors=self._default_cleaning['sor_nb_neighbors'],
@@ -604,6 +625,148 @@ class ColmapAPI:
         self._pcd = pcd_clean         # cleaned becomes the default
         self._cameras = colmap_cameras
         self.activate_camera_name = self.camera_names[0]
+        # save clean pcd 
+        # o3d.io.write_point_cloud(osp.join(self.data_path, "colmap/cleaned.ply"), self._pcd)
+        # save clean pcd to point3D.bin
+        self._colmap_point_ids = point_ids
+        self._colmap_image_ids = point_image_ids 
+        self._clean_indices = keep_indices
+        self._reconstruction = reconstruction  # keep the full reconstruction object
+        self.save_for_recon()
+        print('COLMAP camera estimation done.')
+
+    def save_for_recon(self):
+        realdir = osp.join(self.data_path, 'colmap')
+        camerasfile = os.path.join(realdir, 'sparse/0/cameras.bin')
+        camdata = read_model.read_cameras_binary(camerasfile)
+        
+        # cam = camdata[camdata.keys()[0]]
+        list_of_keys = list(camdata.keys())
+        cam = camdata[list_of_keys[0]]
+        print( 'Cameras', len(cam))
+
+        h, w, f = cam.height, cam.width, cam.params[0]
+        # w, h, f = factor * w, factor * h, factor * f
+        hwf = np.array([h,w,f]).reshape([3,1])
+        
+        imagesfile = os.path.join(realdir, 'sparse/0/images.bin')
+        imdata = read_model.read_images_binary(imagesfile)
+        
+        w2c_mats = []
+        bottom = np.array([0,0,0,1.]).reshape([1,4])
+        
+        names = [imdata[k].name for k in imdata]
+        print( 'Images #', len(names))
+        perm = np.argsort(names)
+        for k in imdata:
+            im = imdata[k]
+            R = im.qvec2rotmat()
+            t = im.tvec.reshape([3,1])
+            m = np.concatenate([np.concatenate([R, t], 1), bottom], 0)
+            w2c_mats.append(m)
+        
+        w2c_mats = np.stack(w2c_mats, 0)
+        c2w_mats = np.linalg.inv(w2c_mats)
+        
+        poses = c2w_mats[:, :3, :4].transpose([1,2,0])
+        poses = np.concatenate([poses, np.tile(hwf[..., np.newaxis], [1,1,poses.shape[-1]])], 1)
+        
+        # points3dfile = os.path.join(realdir, 'sparse/0/points3D.bin')
+        # pts3d = read_model.read_points3d_binary(points3dfile)
+        
+        # must switch to [-u, r, -t] from [r, -u, t], NOT [r, u, -t]
+        poses = np.concatenate([poses[:, 1:2, :], poses[:, 0:1, :], -poses[:, 2:3, :], poses[:, 3:4, :], poses[:, 4:5, :]], 1)
+        # added
+        poses = np.moveaxis(poses, -1, 0)
+        poses = poses[perm]
+
+        images = [self._reconstruction.images[k] for k in sorted(self._reconstruction.images.keys())]
+        ordered_images = [images[i] for i in perm]
+        image_id_to_index = {im.image_id: idx for idx, im in enumerate(ordered_images)}
+        clean_to_raw = self._clean_indices
+        # if clean_to_raw is None or len(clean_to_raw) != len(self._pcd.points):
+        #     clean_to_raw = self._map_clean_points_to_raw()
+        clean_to_raw = np.asarray(clean_to_raw, dtype=np.int64)
+        points = np.asarray(self._pcd.points, dtype=np.float32)
+        view_id = np.zeros((len(ordered_images), len(points)), dtype=bool)
+        for clean_idx, raw_idx in enumerate(clean_to_raw):
+            if raw_idx < 0 or raw_idx >= len(self._colmap_image_ids):
+                continue
+            for img_id in self._colmap_image_ids[raw_idx]:
+                mapped = image_id_to_index.get(int(img_id))
+                if mapped is not None:
+                    view_id[mapped, clean_idx] = True
+        
+        # np.save(osp.join(self.data_path, "poses.npy"), poses) # NO need to save anymore
+        out_dir = os.path.join(self.data_path, 'preprocessed')
+        os.makedirs(out_dir, exist_ok=True)
+        sfm_dir = osp.join(out_dir, "sfm_pts")
+        os.makedirs(sfm_dir, exist_ok=True)
+        np.save(osp.join(sfm_dir, "points.npy"), points)
+        np.save(osp.join(sfm_dir, "view_id.npy"), view_id)
+        o3d.io.write_point_cloud(osp.join(self.data_path, "sparse_points_interest.ply"), self._pcd)
+
+        # gen_cameras.py
+        poses_hwf = poses
+        poses_raw = poses_hwf[:, :, :4]
+        hwf = poses_hwf[:, :, 4]
+        pose = np.diag([1.0, 1.0, 1.0, 1.0])
+        pose[:3, :4] = poses_raw[0]
+        cam_dict = dict()
+        n_images = len(poses_raw)
+
+        # Convert space
+        convert_mat = np.zeros([4, 4], dtype=np.float32)
+        convert_mat[0, 1] = 1.0
+        convert_mat[1, 0] = 1.0
+        convert_mat[2, 2] =-1.0
+        convert_mat[3, 3] = 1.0
+
+        for i in range(n_images):
+            pose = np.diag([1.0, 1.0, 1.0, 1.0]).astype(np.float32)
+            pose[:3, :4] = poses_raw[i]
+            pose = pose @ convert_mat
+            h, w, f = hwf[i, 0], hwf[i, 1], hwf[i, 2]
+            intrinsic = np.diag([f, f, 1.0, 1.0]).astype(np.float32)
+            intrinsic[0, 2] = (w - 1) * 0.5
+            intrinsic[1, 2] = (h - 1) * 0.5
+            w2c = np.linalg.inv(pose)
+            world_mat = intrinsic @ w2c
+            world_mat = world_mat.astype(np.float32)
+            cam_dict['camera_mat_{}'.format(i)] = intrinsic
+            cam_dict['camera_mat_inv_{}'.format(i)] = np.linalg.inv(intrinsic)
+            cam_dict['world_mat_{}'.format(i)] = world_mat
+            cam_dict['world_mat_inv_{}'.format(i)] = np.linalg.inv(world_mat)
+
+
+        pcd = trimesh.load(os.path.join(self.data_path, 'sparse_points_interest.ply'))
+        vertices = pcd.vertices
+        bbox_max = np.max(vertices, axis=0)
+        bbox_min = np.min(vertices, axis=0)
+        center = (bbox_max + bbox_min) * 0.5
+        radius = np.linalg.norm(vertices - center, ord=2, axis=-1).max()
+        scale_mat = np.diag([radius, radius, radius, 1.0]).astype(np.float32)
+        scale_mat[:3, 3] = center
+
+        for i in range(n_images):
+            cam_dict['scale_mat_{}'.format(i)] = scale_mat
+            cam_dict['scale_mat_inv_{}'.format(i)] = np.linalg.inv(scale_mat)
+
+        
+        os.makedirs(os.path.join(out_dir, 'image'), exist_ok=True)
+        os.makedirs(os.path.join(out_dir, 'mask'), exist_ok=True)
+
+        image_list = glob.glob(os.path.join(self.data_path, 'images/*.png')) + glob.glob(os.path.join(self.data_path, 'images/*.jpg'))
+        image_list.sort()
+
+        for i, image_path in enumerate(image_list):
+            img = cv.imread(image_path)
+            cv.imwrite(os.path.join(out_dir, 'image', '{:0>3d}.png'.format(i)), img)
+            cv.imwrite(os.path.join(out_dir, 'mask', '{:0>3d}.png'.format(i)), np.ones_like(img) * 255)
+
+        np.savez(os.path.join(out_dir, 'cameras.npz'), **cam_dict)
+        processing_single_scene(in_folder=self.data_path, out_folder=out_dir)
+
 
     @staticmethod
     def _list_images_in_folder(directory):
