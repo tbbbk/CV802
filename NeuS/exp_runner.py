@@ -12,6 +12,7 @@ from shutil import copyfile
 from icecream import ic
 from tqdm import tqdm
 from pyhocon import ConfigFactory
+import json
 from models.dataset import Dataset
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
 from models.renderer import NeuSRenderer
@@ -34,6 +35,7 @@ class Runner:
         os.makedirs(self.base_exp_dir, exist_ok=True)
         self.dataset = Dataset(self.conf['dataset'])
         self.iter_step = 0
+        self._scale_mat_inv = np.linalg.inv(self.dataset.scale_mats_np[0]).astype(np.float32)
 
         # Training parameters
         self.end_iter = self.conf.get_int('train.end_iter')
@@ -325,6 +327,132 @@ class Runner:
         img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3]) * 256).clip(0, 255).astype(np.uint8)
         return img_fine
 
+    def _load_camera_pose_file(self, path):
+        with open(path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        extrinsic = np.asarray(data["extrinsic"], dtype=np.float32)
+        intrinsic = data.get("intrinsic")
+        if intrinsic is not None:
+            intrinsic = np.asarray(intrinsic, dtype=np.float32)
+        frame_size = data.get("frame_size", {})
+        width = frame_size.get("width")
+        height = frame_size.get("height")
+        return extrinsic, intrinsic, (width, height)
+
+    def _prepare_intrinsics(self, intrinsic, src_size):
+        if intrinsic is None:
+            base = self.dataset.intrinsics_all[0][:3, :3].detach().cpu().numpy().astype(np.float32)
+            return base
+        intr = intrinsic[:3, :3] if intrinsic.shape[0] == 4 else intrinsic.copy()
+        # No need to scale if src_size matches dataset size
+        return intr.astype(np.float32)
+
+    def _normalize_pose_to_neus(self, pose):
+        """Transform GUI camera pose to NeuS normalized space"""
+        pose = np.asarray(pose, dtype=np.float32)
+        if pose.shape == (3, 4):
+            pose = np.vstack([pose, np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)])
+
+        # Coordinate system conversion from Open3D to OpenCV/NeuS
+        o3d_to_cv_transform = np.array([
+            [1, 0, 0, 0],
+            [0, -1, 0, 0],
+            [0, 0, -1, 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+        
+        pose_rot_converted = pose @ o3d_to_cv_transform
+        pose_rot_converted[:3, 3] = pose[:3, 3]
+
+        scale_mat_inv = self._scale_mat_inv
+        pose_normalized = scale_mat_inv @ pose_rot_converted
+        
+        return pose_normalized
+
+    def render_novel_image2(self, pose_0, pose_1, ratio, intrinsics, resolution_level):
+        rays_o, rays_d = self.dataset.gen_rays_between2(
+            pose_0, pose_1, ratio, intrinsics=intrinsics, resolution_level=resolution_level)
+        H, W, _ = rays_o.shape
+        rays_o = rays_o.reshape(-1, 3).split(self.batch_size)
+        rays_d = rays_d.reshape(-1, 3).split(self.batch_size)
+        out_rgb_fine = []
+        for rays_o_batch, rays_d_batch in zip(rays_o, rays_d):
+            near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
+            background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
+            render_out = self.renderer.render(
+                rays_o_batch, rays_d_batch, near, far,
+                cos_anneal_ratio=self.get_cos_anneal_ratio(),
+                background_rgb=background_rgb)
+            out_rgb_fine.append(render_out['color_fine'].detach().cpu().numpy())
+            del render_out
+        img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3]) * 256).clip(0, 255).astype(np.uint8)
+        return img_fine
+
+    def interpolate_view2(self, pose_path_0, pose_path_1, n_frames=60, resolution_level=4):
+        pose_0, intr_0, size_0 = self._load_camera_pose_file(pose_path_0)
+        pose_1, intr_1, size_1 = self._load_camera_pose_file(pose_path_1)
+
+        # Normalize poses to NeuS space
+        pose_0_norm = self._normalize_pose_to_neus(pose_0)
+        pose_1_norm = self._normalize_pose_to_neus(pose_1)
+
+        # Prepare intrinsics and scale to dataset resolution
+        intr_0 = self._prepare_intrinsics(intr_0, size_0)
+        intr_1 = self._prepare_intrinsics(intr_1, size_1) if intr_1 is not None else intr_0
+        
+        # Scale intrinsics to match dataset resolution
+        if size_0 and all(size_0):
+            src_w, src_h = size_0
+            dst_w, dst_h = self.dataset.W, self.dataset.H
+            scale_x = dst_w / float(src_w)
+            scale_y = dst_h / float(src_h)
+            intr_0 = intr_0.copy()
+            intr_0[0, 0] *= scale_x
+            intr_0[0, 2] *= scale_x
+            intr_0[1, 1] *= scale_y
+            intr_0[1, 2] *= scale_y
+        
+        if size_1 and all(size_1):
+            src_w, src_h = size_1
+            dst_w, dst_h = self.dataset.W, self.dataset.H
+            scale_x = dst_w / float(src_w)
+            scale_y = dst_h / float(src_h)
+            intr_1 = intr_1.copy()
+            intr_1[0, 0] *= scale_x
+            intr_1[0, 2] *= scale_x
+            intr_1[1, 1] *= scale_y
+            intr_1[1, 2] *= scale_y
+        
+
+        images = []
+        video_dir = os.path.join(self.base_exp_dir, 'render')
+        os.makedirs(video_dir, exist_ok=True)
+
+        for i in range(n_frames):
+            print(f"Rendering frame {i}/{n_frames}")
+            ratio = np.sin(((i / n_frames) - 0.5) * np.pi) * 0.5 + 0.5
+            # Interpolate intrinsics
+            intr_interp = (1.0 - ratio) * intr_0 + ratio * intr_1
+            img = self.render_novel_image2(pose_0_norm, pose_1_norm, ratio, intr_interp, resolution_level)
+            images.append(img)
+            # img_path = os.path.join(video_dir, f'interpolated_56_{i:03d}.png')
+            # cv.imwrite(img_path, img)
+
+        forward = images.copy()
+        images.extend(reversed(forward))
+
+        h, w, _ = images[0].shape
+        fourcc = cv.VideoWriter_fourcc(*'mp4v')
+        pose_name_0 = os.path.splitext(os.path.basename(pose_path_0))[0]
+        pose_name_1 = os.path.splitext(os.path.basename(pose_path_1))[0]
+        print(f'Pose names: {pose_name_0}, {pose_name_1}')
+        video_path = os.path.join(video_dir, f'arbitrary_p{pose_name_0}_{pose_name_1}.mp4')
+        writer = cv.VideoWriter(video_path, fourcc, 30, (w, h))
+        for image in images:
+            writer.write(image)
+        writer.release()
+        print(f'Saved arbitrary interpolation to {video_path}')
+
     def validate_mesh(self, world_space=False, resolution=64, threshold=0.0):
         bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)
         bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32)
@@ -350,6 +478,8 @@ class Runner:
                                                   img_idx_1,
                                                   np.sin(((i / n_frames) - 0.5) * np.pi) * 0.5 + 0.5,
                           resolution_level=4))
+            # img_path = os.path.join(os.path.join(self.base_exp_dir, 'render'), f'interpolated_oriold_{i:03d}.png')
+            # cv.imwrite(img_path, images[-1])
         for i in range(n_frames):
             images.append(images[n_frames - i - 1])
 
@@ -382,6 +512,10 @@ if __name__ == '__main__':
     parser.add_argument('--is_continue', default=False, action="store_true")
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--case', type=str, default='')
+    parser.add_argument('--pose0', type=str, default=None)
+    parser.add_argument('--pose1', type=str, default=None)
+    parser.add_argument('--interp_frames', type=int, default=60)
+    parser.add_argument('--interp_resolution_level', type=int, default=4)
 
     args = parser.parse_args()
 
@@ -392,6 +526,12 @@ if __name__ == '__main__':
         runner.train()
     elif args.mode == 'validate_mesh':
         runner.validate_mesh(world_space=True, resolution=512, threshold=args.mcube_threshold)
+    elif args.mode == 'arbitrary_interpolate':
+        if not args.pose0 or not args.pose1:
+            raise ValueError("arbitrary_interpolate mode requires --pose0 and --pose1.")
+        runner.interpolate_view2(args.pose0, args.pose1,
+                                 n_frames=args.interp_frames,
+                                 resolution_level=args.interp_resolution_level)
     elif args.mode.startswith('interpolate'):  # Interpolate views given two image indices
         _, img_idx_0, img_idx_1 = args.mode.split('_')
         img_idx_0 = int(img_idx_0)

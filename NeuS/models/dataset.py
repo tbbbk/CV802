@@ -131,6 +131,7 @@ class Dataset:
         l = resolution_level
         tx = torch.linspace(0, self.W - 1, self.W // l)
         ty = torch.linspace(0, self.H - 1, self.H // l)
+        # pixels_x, pixels_y = torch.meshgrid(tx, ty, indexing='ij')
         pixels_x, pixels_y = torch.meshgrid(tx, ty)
         p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1)  # W, H, 3
         p = torch.matmul(self.intrinsics_all_inv[0, None, None, :3, :3], p[:, :, :, None]).squeeze()  # W, H, 3
@@ -156,6 +157,64 @@ class Dataset:
         rays_v = torch.matmul(rot[None, None, :3, :3], rays_v[:, :, :, None]).squeeze()  # W, H, 3
         rays_o = trans[None, None, :3].expand(rays_v.shape)  # W, H, 3
         return rays_o.transpose(0, 1), rays_v.transpose(0, 1)
+
+    def gen_rays_between2(self, pose_0, pose_1, ratio, intrinsics=None, resolution_level=1):
+        """Generate rays for arbitrary camera poses (already in NeuS normalized space)"""
+        device = self.device
+        l = max(1, resolution_level)
+        width = max(1, self.W // l)
+        height = max(1, self.H // l)
+        tx = torch.linspace(0, self.W - 1, width, device=device)
+        ty = torch.linspace(0, self.H - 1, height, device=device)
+        pixels_x, pixels_y = torch.meshgrid(tx, ty, indexing='ij')
+        p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1)
+        
+        if intrinsics is None:
+            intr_tensor = self.intrinsics_all[0][:3, :3].clone()
+        else:
+            intr_array = np.asarray(intrinsics, dtype=np.float32)
+            intr_array = intr_array[:3, :3] if intr_array.shape[0] == 4 else intr_array
+            intr_tensor = torch.from_numpy(intr_array).to(device)
+        intr_tensor = intr_tensor.float()
+        intr_inv = torch.inverse(intr_tensor)
+        
+        p = torch.matmul(intr_inv, p.reshape(-1, 3).T).T.reshape(width, height, 3)
+        rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)
+        
+        pose_0 = np.asarray(pose_0, dtype=np.float32)
+        pose_1 = np.asarray(pose_1, dtype=np.float32)
+        
+        # Convert camera-to-world to world-to-camera (like the old method)
+        w2c_0 = np.linalg.inv(pose_0)
+        w2c_1 = np.linalg.inv(pose_1)
+        
+        # Extract rotation and translation from world-to-camera matrices
+        rot_0 = w2c_0[:3, :3]
+        rot_1 = w2c_1[:3, :3]
+        
+        # SLERP for rotation (in world-to-camera space)
+        rots = Rot.from_matrix(np.stack([rot_0, rot_1]))
+        slerp = Slerp([0, 1], rots)
+        rot_interp = slerp(ratio).as_matrix()
+        
+        # Linear interpolation for translation (in world-to-camera space)
+        trans_interp = (1.0 - ratio) * w2c_0[:3, 3] + ratio * w2c_1[:3, 3]
+        
+        # Build interpolated world-to-camera pose
+        w2c_interp = np.eye(4, dtype=np.float32)
+        w2c_interp[:3, :3] = rot_interp
+        w2c_interp[:3, 3] = trans_interp
+        
+        # Convert back to camera-to-world
+        pose_interp = np.linalg.inv(w2c_interp)
+        
+        rot = torch.from_numpy(pose_interp[:3, :3]).to(device)
+        trans = torch.from_numpy(pose_interp[:3, 3]).to(device)
+        rays_v = torch.einsum('ij,xyj->xyi', rot, rays_v)
+        rays_o = trans.view(1, 1, 3).expand(rays_v.shape)
+        
+        return rays_o.transpose(0, 1), rays_v.transpose(0, 1)
+
 
     def near_far_from_sphere(self, rays_o, rays_d):
         a = torch.sum(rays_d**2, dim=-1, keepdim=True)
