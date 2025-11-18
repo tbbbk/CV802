@@ -25,8 +25,6 @@ git commit -m "Your commit message"
 git push
 ```
 Create a Pull Request (PR) on GitHub.
-# Basic Method
-Please refer to [vgg-t](https://vgg-t.github.io).
 
 
 # Subproject2 Surface Reconstruction
@@ -35,20 +33,26 @@ Please refer to [vgg-t](https://vgg-t.github.io).
 
 ## Workflow of Subproject2
 1. Run `python main.py` with GUI, just like Subproject1, to obtain the sparse point cloud and camera poses. An extra preproccessed folder will be generated under the data folder. It may take longer than before, about 10s before you can see the point cloud.
+
 2. Move the preproccessed folder to a server/laptop with CUDA support.
+
 3. Run GeoNeuS on the server, which will start training. 
 ```
 python exp_runner.py --mode train --conf ./confs/womask.conf --case preprocessed
 ```
 Typically, it takes 40 minutes to run 30k steps on a RTX A6000 GPU to obtain good mesh.
 Run 300k steps (about 7 hours) if you want state-of-the-art quality mesh.
+
 4. After training, copy the generated exp folder to the same position of Textured-NeuS repo. Run Textured-NeuS on the server to obtain high resolution textured mesh. 
 ```
 python exp_runner.py --mode validate_mesh --case preprocessed --is_continue
 ```
 This is important, as the mesh generated when training is lack of texture and in low resolution for quick visualization.
+
 5. Move the generated `.ply` file back to original data folder on your MacBook.
+
 6. Visualize the generated mesh by clicking the `Show Constructed Mesh` button on the GUI.
+
 7. Tips: Sometimes NCC Loss will cause training instability. When this happens, you can try to disable NCC Loss by commenting the corresponding lines in `exp_runner.py` in GeoNeuS.
 
 ## Additional Environment of Subproject2 Local Part
@@ -71,3 +75,37 @@ conda install -c bottler nvidiacub
 conda install pytorch3d==0.6.2 -c pytorch3d -c pytorch -c nvidia -c conda-forge
 pip install -r requirements.txt
 ```
+
+
+# Subproject3 Novel-view Synthesis
+We use NeuS, a neural rendering method, for novel view/scene synthesis.
+We need to prepare data with the local part of Subproject2 first.
+After that, train NeuS on the server with CUDA support:
+```
+python exp_runner.py --mode train --conf ./confs/womask.conf --case preprocessed
+```
+
+Inference (interpolate) a mp4 video between two existed views
+```
+python exp_runner.py --mode interpolate_<img_idx_0>_<img_idx_1> --conf ./confs/womask.conf --case <case_name> --is_continue
+```
+
+An example:
+```
+CUDA_VISIBLE_DEVICES=6 python exp_runner.py --mode interpolate_0_30  --conf ./confs/womask.conf  --case final_woncc  --is_continue
+```
+
+Inference (interpolate) a mp4 video between arbitrary two views:
+1. Click 'Export Camera Poses' in the menu of GUI to export camera poses of current scene.
+2. Export two times, and you will get two json files.
+3. In the CUDA environment where you trained NeuS, run something like:
+```
+python exp_runner.py --mode arbitrary_interpolate --pose0 <json_path_0> --pose1 <json_path_1> --conf ./confs/womask.conf --case <case_name> --is_continue
+```
+
+Generated video looks like:
+![video_example](./assets/output.gif)
+
+
+
+> NeuS is based on NeRF, takes about 20 minutes to inference a video with approximately 60 frames on a RTX A6000 GPU.

@@ -15,6 +15,7 @@ import os
 import os.path as osp
 import platform
 import sys
+import json
 
 from modules.colmap.api import ColmapAPI
 from modules.gui.settings import Settings
@@ -31,6 +32,7 @@ class AppWindow:
     MENU_QUIT = 15
     MENU_SHOW_SETTINGS = 21
     MENU_ABOUT = 31
+    MENU_EXPORT_CAMERA_POSE = 16
 
     DEFAULT_IBL = "default"
 
@@ -169,6 +171,7 @@ class AppWindow:
             file_menu.add_item("Open existing result...", AppWindow.MENU_OPEN_EXISTING)
             file_menu.add_item("Open image folder...", AppWindow.MENU_OPEN_IMAGE_FOLDER)
             file_menu.add_item("Export Current Image...", AppWindow.MENU_EXPORT)
+            file_menu.add_item("Export Camera Pose...", AppWindow.MENU_EXPORT_CAMERA_POSE)
 
             if not isMacOS:
                 file_menu.add_separator()
@@ -209,6 +212,8 @@ class AppWindow:
         w.set_on_menu_item_activated(AppWindow.MENU_SHOW_SETTINGS,
                                      self._on_menu_toggle_settings_panel)
         w.set_on_menu_item_activated(AppWindow.MENU_ABOUT, self._on_menu_about)
+        w.set_on_menu_item_activated(AppWindow.MENU_EXPORT_CAMERA_POSE,
+                                     self._on_menu_export_camera_pose)
         # ----
 
         self._apply_settings()
@@ -761,3 +766,72 @@ class AppWindow:
         dlg_layout.add_child(h)
         dlg.add_child(dlg_layout)
         self.window.show_dialog(dlg)
+    def _on_menu_export_camera_pose(self):
+        dlg = gui.FileDialog(gui.FileDialog.SAVE, "Save camera pose",
+                             self.window.theme)
+        dlg.add_filter(".json", "JSON files (.json)")
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        try:
+            dlg.set_filename(f"camera_pose_{timestamp}.json")
+        except AttributeError:
+            pass
+        dlg.set_on_cancel(self._on_file_dialog_cancel)
+        dlg.set_on_done(self._on_export_camera_pose_dialog_done)
+        self.window.show_dialog(dlg)
+
+    def _on_export_camera_pose_dialog_done(self, filename):
+        self.window.close_dialog()
+        directory, name = osp.split(filename)
+        if name.lower().endswith(".json"):
+            directory = directory or os.getcwd()
+        else:
+            directory = filename if osp.isdir(filename) else (directory or os.getcwd())
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        final_path = osp.join(directory, f"camera_pose_{timestamp}.json")
+        suffix = 1
+        while osp.exists(final_path):
+            final_path = osp.join(directory, f"camera_pose_{timestamp}_{suffix}.json")
+            suffix += 1
+        self._export_current_camera_pose(final_path)
+
+    def _export_current_camera_pose(self, path):
+        camera = self._scene.scene.camera
+        if camera is None:
+            self._show_message("Error", "Camera pose unavailable.")
+            return
+        view_matrix = np.asarray(camera.get_view_matrix())
+        projection_matrix = np.asarray(camera.get_projection_matrix())
+        extrinsic = np.linalg.inv(view_matrix)  # camera-to-world for NeuS’ frame
+        frame = self._scene.frame
+        width = max(1, frame.width)
+        height = max(1, frame.height)
+        fov_deg = camera.get_field_of_view()
+        aspect = width / height if height else 1.0
+        focal_y = 0.5 * height / np.tan(np.deg2rad(fov_deg) * 0.5)
+        focal_x = focal_y * aspect
+        cx = width / 2.0
+        cy = height / 2.0
+        intrinsic = np.array([[focal_x, 0.0, cx],
+                              [0.0, focal_y, cy],
+                              [0.0, 0.0, 1.0]], dtype=float)
+        rotation = extrinsic[:3, :3]
+        position = extrinsic[:3, 3]
+        forward = -rotation[:, 2]
+        look_at = position + forward
+        up = rotation[:, 1]
+        payload = {
+            "view_matrix": view_matrix.tolist(),
+            "projection_matrix": projection_matrix.tolist(),
+            "extrinsic": extrinsic.tolist(),
+            "intrinsic": intrinsic.tolist(),
+            "frame_size": {"width": int(width), "height": int(height)},
+            "field_of_view_degrees": float(fov_deg),
+            "camera_position": position.tolist(),
+            "camera_look_at": look_at.tolist(),
+            "camera_up": up.tolist(),
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+        except OSError as exc:
+            self._show_message("Error", f"Failed to save file:\n{exc}")
